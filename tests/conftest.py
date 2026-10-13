@@ -4,7 +4,13 @@ from datetime import datetime, timezone
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from mongomock_motor import AsyncMongoMockClient
+try:
+    from mongomock_motor import AsyncMongoMockClient
+except ImportError as err:
+    raise ImportError(
+        "mongomock_motor is required for the hermetic in-memory test suite. "
+        "Please install all dependencies: pip install -r requirements.txt (or pip install 'mongomock-motor>=0.0.29')"
+    ) from err
 
 from app.core.config import Settings
 from app.db.client import get_database
@@ -48,7 +54,34 @@ async def mock_db():
             "designation": "Product Manager",
             "is_active": True,
         },
+        {
+            "employee_id": "MGR-5001",
+            "name": "Carol Danvers",
+            "email": "carol.danvers@hr0ne.internal",
+            "department": "Management",
+            "designation": "Engineering Manager",
+            "is_active": True,
+        },
+        {
+            "employee_id": "MGR-5002",
+            "name": "Dave Rogers",
+            "email": "dave.rogers@hr0ne.internal",
+            "department": "Management",
+            "designation": "Operations Manager",
+            "is_active": True,
+        },
+        {
+            "employee_id": "MGR-1001",
+            "name": "Eve Adams",
+            "email": "eve.adams@hr0ne.internal",
+            "department": "Management",
+            "designation": "Operations Manager",
+            "is_active": True,
+        },
     ])
+
+
+
 
     yield db
 
