@@ -33,8 +33,14 @@ class MongoDBManager:
                 minPoolSize=cfg.MONGODB_MIN_POOL_SIZE,
                 maxPoolSize=cfg.MONGODB_MAX_POOL_SIZE,
                 serverSelectionTimeoutMS=cfg.MONGODB_SERVER_SELECTION_TIMEOUT_MS,
+                connectTimeoutMS=cfg.MONGODB_CONNECT_TIMEOUT_MS,
+                socketTimeoutMS=cfg.MONGODB_SOCKET_TIMEOUT_MS,
+                maxIdleTimeMS=cfg.MONGODB_MAX_IDLE_TIME_MS,
+                retryWrites=True,
+                retryReads=True,
             )
             self.database = self.client[cfg.MONGODB_DB_NAME]
+
             logger.info("MongoDB client pool initialized for database: %s", cfg.MONGODB_DB_NAME)
         except Exception as exc:
             logger.error("Failed to initialize MongoDB client: %s", str(exc))

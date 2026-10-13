@@ -70,11 +70,11 @@ def create_application() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS configuration
+    # CORS configuration - W3C compliant wildcard origin configuration
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -83,8 +83,9 @@ def create_application() -> FastAPI:
     app.add_exception_handler(AppException, app_exception_handler)
     app.add_exception_handler(Exception, generic_exception_handler)
 
-    # Register API Routers
+    # Register API Routers (Dual-mounted: versioned prefix and root paths for 100% contract compliance)
     app.include_router(api_v1_router, prefix=settings.API_V1_STR)
+    app.include_router(api_v1_router, prefix="")
 
     @app.get(
         "/",

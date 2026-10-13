@@ -34,9 +34,12 @@ class Settings(BaseSettings):
         default="attendance_analytics_db",
         description="Target database name",
     )
-    MONGODB_MIN_POOL_SIZE: int = 10
+    MONGODB_MIN_POOL_SIZE: int = 1
     MONGODB_MAX_POOL_SIZE: int = 50
     MONGODB_SERVER_SELECTION_TIMEOUT_MS: int = 5000
+    MONGODB_CONNECT_TIMEOUT_MS: int = 10000
+    MONGODB_SOCKET_TIMEOUT_MS: int = 20000
+    MONGODB_MAX_IDLE_TIME_MS: int = 45000
 
     @property
     def is_testing(self) -> bool:
