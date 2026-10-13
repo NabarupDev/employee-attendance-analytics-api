@@ -1,5 +1,6 @@
 """Employee management and registration endpoints."""
 
+from typing import List, Optional
 from fastapi import APIRouter, Depends, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -32,6 +33,33 @@ async def register_employee(
 
 
 @router.get(
+    "",
+    response_model=ApiResponse[list[EmployeeResponse]],
+    summary="List Employees",
+    description="Retrieve list of registered employees with optional department or status filtering.",
+)
+async def list_employees(
+    department: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    limit: int = 100,
+    skip: int = 0,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+) -> ApiResponse[list[EmployeeResponse]]:
+    """List employees."""
+    service = EmployeeService(db)
+    employees = await service.list_employees(
+        department=department,
+        is_active=is_active,
+        limit=limit,
+        skip=skip,
+    )
+    return ApiResponse(
+        message=f"Found {len(employees)} employee(s).",
+        data=employees,
+    )
+
+
+@router.get(
     "/{employee_id}",
     response_model=ApiResponse[EmployeeResponse],
     summary="Get Employee Details",
@@ -51,6 +79,9 @@ async def get_employee(
             email=employee["email"],
             department=employee["department"],
             designation=employee.get("designation", "Employee"),
+            shift_start=employee.get("shift_start", "09:00"),
+            shift_end=employee.get("shift_end", "18:00"),
+            joined_on=employee.get("joined_on"),
             is_active=employee.get("is_active", True),
         )
     )

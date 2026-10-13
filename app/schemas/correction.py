@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 from app.schemas.attendance import validate_timezone_aware_timestamp
 
@@ -19,8 +19,8 @@ class CorrectionStatus(str, Enum):
 class ProposedPunchInterval(BaseModel):
     """Proposed punch session interval."""
 
-    punch_in: datetime = Field(..., description="Proposed check-in timestamp (UTC)")
-    punch_out: datetime = Field(..., description="Proposed check-out timestamp (UTC)")
+    punch_in: datetime = Field(..., description="Proposed check-in timestamp (UTC)", examples=["2026-10-13T09:00:00Z"])
+    punch_out: datetime = Field(..., description="Proposed check-out timestamp (UTC)", examples=["2026-10-13T17:30:00Z"])
 
     @field_validator("punch_in", "punch_out", mode="before")
     @classmethod
@@ -33,15 +33,32 @@ class ProposedPunchInterval(BaseModel):
             raise ValueError("Proposed punch_out must be strictly after punch_in.")
         return self
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "punch_in": "2026-10-13T09:00:00Z",
+                "punch_out": "2026-10-13T17:30:00Z",
+            }
+        }
+    )
+
 
 class CorrectionCreateRequest(BaseModel):
     """Request payload to submit an attendance correction request."""
 
-    employee_id: str = Field(..., min_length=2, max_length=50, description="Employee identifier")
+    employee_id: str = Field(
+        ...,
+        validation_alias=AliasChoices("employee_id", "emp_code"),
+        min_length=2,
+        max_length=50,
+        description="Employee identifier (e.g. EMP-1001 or emp_code)",
+        examples=["EMP-1001"],
+    )
     attendance_date: str = Field(
         ...,
         pattern=r"^\d{4}-\d{2}-\d{2}$",
         description="Target attendance calendar date (YYYY-MM-DD)",
+        examples=["2026-10-13"],
     )
     proposed_punches: List[ProposedPunchInterval] = Field(
         ...,
@@ -53,6 +70,7 @@ class CorrectionCreateRequest(BaseModel):
         min_length=10,
         max_length=500,
         description="Mandatory reason justifying the correction (minimum 10 characters)",
+        examples=["Biometric badge scanner was down during morning entry."],
     )
 
     @model_validator(mode="after")
@@ -73,6 +91,22 @@ class CorrectionCreateRequest(BaseModel):
                 raise ValueError("Proposed punch intervals cannot overlap.")
         return self
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "employee_id": "EMP-1001",
+                "attendance_date": "2026-10-13",
+                "proposed_punches": [
+                    {
+                        "punch_in": "2026-10-13T09:00:00Z",
+                        "punch_out": "2026-10-13T17:30:00Z",
+                    }
+                ],
+                "reason": "Biometric badge scanner was down during morning entry.",
+            }
+        }
+    )
+
 
 class CorrectionStatusUpdateRequest(BaseModel):
     """Request payload to approve or reject a correction request."""
@@ -80,11 +114,13 @@ class CorrectionStatusUpdateRequest(BaseModel):
     status: CorrectionStatus = Field(
         ...,
         description="New status for the correction request (must be APPROVED or REJECTED)",
+        examples=["APPROVED"],
     )
     remarks: Optional[str] = Field(
         default=None,
         max_length=500,
         description="Optional reviewer remarks explaining the approval or rejection",
+        examples=["Verified against manual security register."],
     )
 
     @field_validator("status")
@@ -94,34 +130,97 @@ class CorrectionStatusUpdateRequest(BaseModel):
             raise ValueError("Target status must be either 'APPROVED' or 'REJECTED'.")
         return v
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "status": "APPROVED",
+                "remarks": "Verified against manual security register.",
+            }
+        }
+    )
+
 
 class CorrectionResponse(BaseModel):
     """Public representation of an attendance correction request."""
 
-    id: str
-    employee_id: str
-    attendance_date: str
+    id: str = Field(..., examples=["6accc924376fb1b94b29bb88"])
+    employee_id: str = Field(..., examples=["EMP-1001"])
+    attendance_date: str = Field(..., examples=["2026-10-13"])
     original_record_snapshot: Optional[Dict[str, Any]] = None
     proposed_punches: List[ProposedPunchInterval]
-    reason: str
-    status: CorrectionStatus
-    requested_by: str
-    reviewed_by: Optional[str] = None
-    review_remarks: Optional[str] = None
+    reason: str = Field(..., examples=["Biometric badge scanner was down during morning entry."])
+    status: CorrectionStatus = Field(..., examples=["PENDING"])
+    requested_by: str = Field(..., examples=["EMP-1001"])
+    reviewed_by: Optional[str] = Field(None, examples=["MGR-5001"])
+    review_remarks: Optional[str] = Field(None, examples=["Verified against manual security register."])
     created_at: datetime
     reviewed_at: Optional[datetime] = None
+
+    @computed_field
+    @property
+    def emp_code(self) -> str:
+        """Alias for employee_id to satisfy contracts expecting emp_code."""
+        return self.employee_id
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "id": "6accc924376fb1b94b29bb88",
+                "employee_id": "EMP-1001",
+                "emp_code": "EMP-1001",
+                "attendance_date": "2026-10-13",
+                "proposed_punches": [
+                    {
+                        "punch_in": "2026-10-13T09:00:00Z",
+                        "punch_out": "2026-10-13T17:30:00Z",
+                    }
+                ],
+                "reason": "Biometric badge scanner was down during morning entry.",
+                "status": "PENDING",
+                "requested_by": "EMP-1001",
+                "reviewed_by": None,
+                "review_remarks": None,
+                "created_at": "2026-10-13T18:00:00Z",
+                "reviewed_at": None,
+            }
+        }
+    )
 
 
 class AuditEntryResponse(BaseModel):
     """Audit entry recording historical attendance changes."""
 
-    correction_id: str
+    correction_id: str = Field(..., examples=["6accc924376fb1b94b29bb88"])
     applied_at: datetime
-    reviewed_by: str
-    reason: str
+    reviewed_by: str = Field(..., examples=["MGR-5001"])
+    reason: str = Field(..., examples=["Biometric badge scanner was down during morning entry."])
     previous_punches: List[Dict[str, Any]]
     new_punches: List[Dict[str, Any]]
-    previous_total_minutes: int
-    new_total_minutes: int
-    previous_status: str
-    new_status: str
+    previous_total_minutes: int = Field(..., examples=[240])
+    new_total_minutes: int = Field(..., examples=[510])
+    previous_status: str = Field(..., examples=["HALF_DAY"])
+    new_status: str = Field(..., examples=["PRESENT"])
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "correction_id": "6accc924376fb1b94b29bb88",
+                "applied_at": "2026-10-13T18:30:00Z",
+                "reviewed_by": "MGR-5001",
+                "reason": "Biometric badge scanner was down during morning entry.",
+                "previous_punches": [],
+                "new_punches": [
+                    {
+                        "session_id": "b3e05a8d-192a-4db3-a9d0-c6e00180fbe8",
+                        "punch_in": "2026-10-13T09:00:00Z",
+                        "punch_out": "2026-10-13T17:30:00Z",
+                        "duration_minutes": 510,
+                    }
+                ],
+                "previous_total_minutes": 240,
+                "new_total_minutes": 510,
+                "previous_status": "HALF_DAY",
+                "new_status": "PRESENT",
+            }
+        }
+    )
