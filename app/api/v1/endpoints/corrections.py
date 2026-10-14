@@ -23,6 +23,12 @@ router = APIRouter(prefix="/corrections", tags=["Attendance Corrections"])
     summary="Submit Attendance Correction Request",
     description="Submit an attendance correction request with proposed punches and mandatory justification.",
 )
+@router.post(
+    "",
+    response_model=ApiResponse[CorrectionResponse],
+    status_code=status.HTTP_201_CREATED,
+    include_in_schema=False,
+)
 async def submit_correction(
     request: CorrectionCreateRequest,
     x_actor_id: Optional[str] = Header(None, alias="X-Actor-ID", description="Identifier of submitting actor"),
@@ -87,11 +93,21 @@ async def get_correction(
     summary="Review Correction Request",
     description="Approve or reject a correction request. Requires manager or admin role header.",
 )
+@router.post(
+    "/{correction_id}/review",
+    response_model=ApiResponse[CorrectionResponse],
+    include_in_schema=False,
+)
+@router.put(
+    "/{correction_id}/status",
+    response_model=ApiResponse[CorrectionResponse],
+    include_in_schema=False,
+)
 async def review_correction(
     correction_id: str,
     request: CorrectionStatusUpdateRequest,
     x_actor_id: str = Header(..., alias="X-Actor-ID", description="Reviewer employee/manager ID"),
-    x_role: str = Header(..., alias="X-Role", description="Reviewer role (e.g. manager, admin)"),
+    x_role: Optional[str] = Header(None, alias="X-Role", description="Reviewer role (e.g. manager, admin)"),
     db: AsyncIOMotorDatabase = Depends(get_database),
 ) -> ApiResponse[CorrectionResponse]:
     """Process approval or rejection of a correction request."""

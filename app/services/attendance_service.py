@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 import logging
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import uuid
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -11,6 +11,7 @@ from pymongo.errors import DuplicateKeyError
 from app.core.exceptions import (
     ActiveSessionExistsError,
     AttendanceRecordNotFoundError,
+    BusinessRuleViolationError,
     InvalidTimestampError,
     NoActiveSessionError,
 )
@@ -18,6 +19,7 @@ from app.schemas.attendance import (
     AttendanceRecordResponse,
     AttendanceStatus,
     PunchSessionResponse,
+    RegularizeAttendanceRequest,
 )
 from app.services.analytics_service import validate_date_range
 from app.services.employee_service import EmployeeService
@@ -325,10 +327,191 @@ class AttendanceService:
 
     async def get_daily_record(self, employee_id: str, date: str) -> AttendanceRecordResponse:
         """Fetch a specific daily attendance record or raise 404."""
-        await self.employee_service.ensure_employee_exists(employee_id)
-        doc = await self.collection.find_one({"employee_id": employee_id, "date": date})
+        employee = await self.employee_service.ensure_employee_exists(employee_id)
+        canonical_id = employee["employee_id"]
+        doc = await self.collection.find_one({"employee_id": canonical_id, "date": date})
         if not doc:
             raise AttendanceRecordNotFoundError(
                 f"No attendance record found for employee '{employee_id}' on date '{date}'."
             )
         return self._doc_to_response(doc)
+
+    async def get_all_attendance(
+        self,
+        employee_id: Optional[str] = None,
+        department: Optional[str] = None,
+        date: Optional[str] = None,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+        skip: int = 0,
+    ) -> List[AttendanceRecordResponse]:
+        """Fetch attendance records across the organization with optional filtering."""
+        query: Dict[str, Any] = {}
+        if employee_id:
+            emp = await self.employee_service.get_employee(employee_id)
+            canonical_id = emp["employee_id"] if emp else employee_id
+            query["employee_id"] = canonical_id
+        if department:
+            query["department"] = department
+        if date:
+            query["date"] = date
+        elif start_date and end_date:
+            validate_date_range(start_date, end_date)
+            query["date"] = {"$gte": start_date, "$lte": end_date}
+        elif start_date:
+            query["date"] = {"$gte": start_date}
+        elif end_date:
+            query["date"] = {"$lte": end_date}
+        if status:
+            query["status"] = status.upper()
+
+        cursor = self.collection.find(query).sort("date", -1).skip(skip).limit(limit)
+        records = await cursor.to_list(length=limit)
+        return [self._doc_to_response(doc) for doc in records]
+
+    async def regularize_attendance(
+        self,
+        employee_id: str,
+        date: str,
+        request: RegularizeAttendanceRequest,
+        actor_id: Optional[str] = None,
+        role: Optional[str] = None,
+    ) -> AttendanceRecordResponse:
+        """
+        Directly regularize an employee's attendance record for a specific date,
+        updating punches, status, and recording an immutable audit entry.
+
+        Enforces:
+        - Authorizing actor identity (X-Actor-ID) is mandatory.
+        - Authorizing actor must exist in registered employee directory and be active.
+        - Authorizing actor must hold a managerial designation in database.
+        - Self-regularization is strictly forbidden (cannot regularize own attendance).
+        """
+        from app.core.exceptions import UnauthorizedReviewerError
+
+        if not actor_id:
+            raise UnauthorizedReviewerError(
+                "Authorizing actor identity (X-Actor-ID) is required for attendance regularization."
+            )
+
+        employee = await self.employee_service.ensure_employee_exists(employee_id)
+        canonical_id = employee["employee_id"]
+
+        # Self-regularization prevention
+        if actor_id == canonical_id:
+            raise UnauthorizedReviewerError(
+                "Employees are strictly prohibited from directly regularizing their own attendance records."
+            )
+
+        # Verify authorizing actor in registered employee directory
+        actor_emp = await self.employee_service.get_employee(actor_id)
+        if not actor_emp:
+            raise UnauthorizedReviewerError(
+                f"Authorizing actor '{actor_id}' not found in registered employee directory."
+            )
+        if not actor_emp.get("is_active", True):
+            raise UnauthorizedReviewerError(
+                f"Authorizing actor '{actor_id}' is inactive and cannot regularize attendance."
+            )
+
+        # Cross-check managerial privilege against database designation
+        designation = (actor_emp.get("designation") or "").lower()
+        is_managerial = any(kw in designation for kw in ("manager", "admin", "lead", "director", "head", "vp"))
+        if not is_managerial:
+            raise UnauthorizedReviewerError(
+                f"Actor '{actor_id}' holds non-managerial designation '{actor_emp.get('designation')}' "
+                "and is not authorized to regularize attendance records."
+            )
+
+        department = employee.get("department", "General")
+        now_utc = datetime.now(timezone.utc)
+
+
+        new_punches = []
+        if request.punches:
+            for p in request.punches:
+                p_in = p.punch_in
+                p_out = p.punch_out
+                if p_out <= p_in:
+                    raise InvalidTimestampError("punch_out must be strictly after punch_in.")
+                dur = int(round((p_out - p_in).total_seconds() / 60))
+                new_punches.append({
+                    "session_id": str(uuid.uuid4()),
+                    "punch_in": p_in,
+                    "punch_out": p_out,
+                    "duration_minutes": dur,
+                })
+        elif request.punch_in and request.punch_out:
+            p_in = request.punch_in
+            p_out = request.punch_out
+            if p_out <= p_in:
+                raise InvalidTimestampError("punch_out must be strictly after punch_in.")
+            dur = int(round((p_out - p_in).total_seconds() / 60))
+            new_punches.append({
+                "session_id": str(uuid.uuid4()),
+                "punch_in": p_in,
+                "punch_out": p_out,
+                "duration_minutes": dur,
+            })
+        else:
+            raise BusinessRuleViolationError("Either punch_in & punch_out or punches list must be provided.")
+
+        new_total_minutes = sum(p["duration_minutes"] for p in new_punches)
+        new_status = self.calculate_status(total_work_minutes=new_total_minutes, has_active_session=False)
+
+        existing_record = await self.collection.find_one({"employee_id": canonical_id, "date": date})
+        prev_punches = existing_record.get("punches", []) if existing_record else []
+        prev_minutes = existing_record.get("total_work_minutes", 0) if existing_record else 0
+        prev_status = (
+            existing_record.get("status", AttendanceStatus.ABSENT.value)
+            if existing_record
+            else AttendanceStatus.ABSENT.value
+        )
+
+        audit_entry = {
+            "regularized_by": actor_id or "system",
+            "reason": request.reason,
+            "applied_at": now_utc,
+            "previous_punches": prev_punches,
+            "new_punches": new_punches,
+            "previous_total_minutes": prev_minutes,
+            "new_total_minutes": new_total_minutes,
+            "previous_status": prev_status,
+            "new_status": new_status.value,
+        }
+
+        await self.collection.update_one(
+            {"employee_id": canonical_id, "date": date},
+            {
+                "$set": {
+                    "punches": new_punches,
+                    "has_active_session": False,
+                    "total_work_minutes": new_total_minutes,
+                    "status": new_status.value,
+                    "is_corrected": True,
+                    "updated_at": now_utc,
+                },
+                "$push": {"audit_history": audit_entry},
+                "$setOnInsert": {
+                    "employee_id": canonical_id,
+                    "department": department,
+                    "date": date,
+                    "created_at": now_utc,
+                },
+            },
+            upsert=True,
+        )
+
+        updated = await self.collection.find_one({"employee_id": canonical_id, "date": date})
+        logger.info(
+            "Attendance regularized for employee: %s on %s by %s: total=%dm status=%s",
+            canonical_id,
+            date,
+            actor_id or "system",
+            new_total_minutes,
+            new_status.value,
+        )
+        return self._doc_to_response(updated)
+

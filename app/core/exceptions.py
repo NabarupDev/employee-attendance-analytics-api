@@ -150,6 +150,28 @@ class UnauthorizedReviewerError(AppException):
         )
 
 
+class ConcurrentModificationError(AppException):
+    """Raised when an optimistic concurrency check detects a conflicting modification."""
+
+    def __init__(self, message: str = "Conflicting concurrent modification detected."):
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_409_CONFLICT,
+            code="CONCURRENT_MODIFICATION_CONFLICT",
+        )
+
+
+class DatabaseInconsistencyError(AppException):
+    """Raised when an operation fails and compensating recovery also fails."""
+
+    def __init__(self, message: str = "System encountered an unrecoverable database inconsistency error."):
+        super().__init__(
+            message=message,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            code="DATABASE_INCONSISTENCY_ERROR",
+        )
+
+
 async def app_exception_handler(request: Request, exc: AppException) -> JSONResponse:
     """Handle custom application exceptions cleanly."""
     return JSONResponse(

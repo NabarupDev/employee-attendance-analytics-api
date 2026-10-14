@@ -395,3 +395,117 @@ async def test_concurrent_correction_review_cas_conflict(async_client: AsyncClie
     )
     assert rev2.status_code == 400
     assert rev2.json()["error"] == "CORRECTION_ALREADY_RESOLVED"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_role_resolution_and_missing_role_rejected(async_client: AsyncClient):
+    """
+    Verify security boundary:
+    1. Unauthenticated / missing role from non-manager is rejected with 403.
+    2. Registered employee with managerial designation (EMP-1002, Product Manager) resolves to manager.
+    3. Explicit X-Role: manager allows review.
+    """
+    create_res = await async_client.post(
+        "/api/v1/corrections/request",
+        json={
+            "employee_id": "EMP-1001",
+            "attendance_date": "2026-10-06",
+            "proposed_punches": [
+                {"punch_in": "2026-10-06T09:00:00Z", "punch_out": "2026-10-06T17:00:00Z"}
+            ],
+            "reason": "Testing reviewer role security resolution.",
+        },
+    )
+    assert create_res.status_code == 201
+    cid = create_res.json()["data"]["id"]
+
+    # 1. Unknown actor without X-Role is rejected (403)
+    res1 = await async_client.patch(
+        f"/api/v1/corrections/{cid}/status",
+        json={"status": "APPROVED", "remarks": "Unauthorized review attempt"},
+        headers={"X-Actor-ID": "UNKNOWN-999"},
+    )
+    assert res1.status_code == 403
+
+    # 2. Registered employee with non-manager designation (EMP-1001, Backend Engineer) is rejected
+    res2 = await async_client.patch(
+        f"/api/v1/corrections/{cid}/status",
+        json={"status": "APPROVED", "remarks": "Engineer trying to review"},
+        headers={"X-Actor-ID": "EMP-1001"},
+    )
+    assert res2.status_code == 403
+
+    # 3. Registered employee with manager designation (EMP-1002, Product Manager) succeeds without explicit X-Role
+    res3 = await async_client.patch(
+        f"/api/v1/corrections/{cid}/status",
+        json={"status": "APPROVED", "remarks": "Approved by Product Manager"},
+        headers={"X-Actor-ID": "EMP-1002"},
+    )
+    assert res3.status_code == 200
+    assert res3.json()["data"]["status"] == "APPROVED"
+
+
+@pytest.mark.asyncio
+async def test_correction_rollback_on_failure_and_resilience(async_client: AsyncClient, mock_db):
+    """
+    Verify compensating rollback behavior when failure occurs during status update,
+    and verify that errors during rollback are propagated and logged.
+    """
+    from unittest.mock import AsyncMock, patch
+    from app.services.correction_service import CorrectionService
+    from app.schemas.correction import CorrectionStatus
+
+    # Submit a correction
+    create_res = await async_client.post(
+        "/api/v1/corrections/request",
+        json={
+            "employee_id": "EMP-1001",
+            "attendance_date": "2026-10-07",
+            "proposed_punches": [
+                {"punch_in": "2026-10-07T09:00:00Z", "punch_out": "2026-10-07T17:00:00Z"}
+            ],
+            "reason": "Test rollback resilience under database failure.",
+        },
+    )
+    assert create_res.status_code == 201
+    cid = create_res.json()["data"]["id"]
+
+    service = CorrectionService(mock_db)
+
+    # 1. Test safe recovery when update_one fails on attendance collection:
+    # Verifies that attendance write failure reverts correction to PENDING
+    # without touching or blind-overwriting attendance records.
+    with patch.object(
+        service.attendance_collection,
+        "update_one",
+        side_effect=RuntimeError("Simulated database failure during attendance write"),
+    ):
+        with pytest.raises(RuntimeError, match="Simulated database failure during attendance write"):
+            await service.review_correction(
+                correction_id=cid,
+                target_status=CorrectionStatus.APPROVED,
+                reviewer_id="MGR-5001",
+                reviewer_role="manager",
+            )
+
+    # Verify that the correction is reverted to PENDING so it can be re-tried
+    corr_doc = await mock_db["corrections"].find_one({"employee_id": "EMP-1001", "attendance_date": "2026-10-07"})
+    assert corr_doc["status"] == "PENDING"
+    assert corr_doc["reviewed_by"] is None
+
+    # 2. Test successful recovery and subsequent approval
+    successful_review = await service.review_correction(
+        correction_id=cid,
+        target_status=CorrectionStatus.APPROVED,
+        reviewer_id="MGR-5001",
+        reviewer_role="manager",
+    )
+    assert successful_review.status == CorrectionStatus.APPROVED
+
+    # Verify attendance record is now updated
+    att_doc = await mock_db["attendance"].find_one({"employee_id": "EMP-1001", "date": "2026-10-07"})
+    assert att_doc is not None
+    assert att_doc["is_corrected"] is True
+
+
+

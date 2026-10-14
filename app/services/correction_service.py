@@ -9,9 +9,13 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pymongo.errors import DuplicateKeyError
 
 from app.core.exceptions import (
+    AppException,
     BusinessRuleViolationError,
+    ConcurrentModificationError,
     CorrectionAlreadyResolvedError,
     CorrectionNotFoundError,
+    DatabaseConnectionError,
+    DatabaseInconsistencyError,
     DuplicateCorrectionRequestError,
     InvalidTimestampError,
     UnauthorizedReviewerError,
@@ -132,6 +136,7 @@ class CorrectionService:
                 "punches": original_record.get("punches", []),
                 "total_work_minutes": original_record.get("total_work_minutes", 0),
                 "status": original_record.get("status", AttendanceStatus.ABSENT.value),
+                "is_corrected": original_record.get("is_corrected", False),
             }
         else:
             original_snapshot = {
@@ -141,6 +146,7 @@ class CorrectionService:
                 "punches": [],
                 "total_work_minutes": 0,
                 "status": AttendanceStatus.ABSENT.value,
+                "is_corrected": False,
             }
 
         now_utc = datetime.now(timezone.utc)
@@ -197,14 +203,11 @@ class CorrectionService:
           sets is_corrected = True, and appends full before/after audit entry.
         - If REJECTED: records decision without modifying attendance record.
         """
-        # Role verification
+        # Role verification & identity resolution
         allowed_roles = {"manager", "admin", "lead"}
-        normalized_role = (reviewer_role or "").lower()
-        if normalized_role not in allowed_roles:
-            raise UnauthorizedReviewerError(
-                f"Role '{reviewer_role}' is not authorized. Must be one of: {allowed_roles}."
-            )
+        normalized_role = (reviewer_role or "").strip().lower()
 
+        # Reviewer identity check
         if not reviewer_id:
             raise UnauthorizedReviewerError("Reviewer identity (X-Actor-ID) is required.")
 
@@ -217,7 +220,7 @@ class CorrectionService:
         if not correction:
             raise CorrectionNotFoundError(correction_id)
 
-        # Self-approval prevention
+        # Self-approval prevention check
         if reviewer_id == correction["employee_id"]:
             raise UnauthorizedReviewerError(
                 "Employees are strictly prohibited from approving their own attendance corrections."
@@ -227,26 +230,71 @@ class CorrectionService:
         if correction["status"] != CorrectionStatus.PENDING.value:
             raise CorrectionAlreadyResolvedError(correction["status"])
 
+        # Reviewer MUST exist in the registered employee directory
+        reviewer_emp = await self.employee_service.get_employee(reviewer_id)
+        if not reviewer_emp:
+            raise UnauthorizedReviewerError(
+                f"Reviewer '{reviewer_id}' not found in registered employee directory."
+            )
+
+        if not reviewer_emp.get("is_active", True):
+            raise UnauthorizedReviewerError(f"Reviewer '{reviewer_id}' is inactive and cannot review requests.")
+
+        # Cross-check managerial privilege against registered employee designation in database
+        designation = (reviewer_emp.get("designation") or "").lower()
+        is_managerial = any(kw in designation for kw in ("manager", "admin", "lead", "director", "head", "vp"))
+
+        if not is_managerial:
+            raise UnauthorizedReviewerError(
+                f"Reviewer '{reviewer_id}' holds non-managerial designation '{reviewer_emp.get('designation')}' "
+                "and is not authorized to review correction requests."
+            )
+
+        if not normalized_role:
+            normalized_role = "manager"
+
+        if normalized_role not in allowed_roles:
+            raise UnauthorizedReviewerError(
+                f"Role '{reviewer_role or 'unspecified'}' is not authorized. Must be one of: {allowed_roles}."
+            )
+
         now_utc = datetime.now(timezone.utc)
 
-        # Update correction document to resolved status atomically first via CAS
-        update_result = await self.corrections_collection.update_one(
-            {"_id": oid, "status": CorrectionStatus.PENDING.value},
-            {
-                "$set": {
-                    "status": target_status.value,
-                    "reviewed_by": reviewer_id,
-                    "review_remarks": remarks,
-                    "reviewed_at": now_utc,
-                }
-            },
-        )
-        if update_result.modified_count == 0:
-            latest = await self.corrections_collection.find_one({"_id": oid})
-            current_status = latest.get("status", "UNKNOWN") if latest else "UNKNOWN"
-            raise CorrectionAlreadyResolvedError(current_status)
-
         if target_status == CorrectionStatus.APPROVED:
+            original_snapshot = correction.get("original_record_snapshot", {})
+            snapshot_punches = original_snapshot.get("punches", []) if original_snapshot else []
+
+            # Optimistic Concurrency Control: detect conflicting attendance modifications prior to write
+            current_att = await self.attendance_collection.find_one({
+                "employee_id": correction["employee_id"],
+                "date": correction["attendance_date"],
+            })
+
+            if current_att:
+                if current_att.get("has_active_session", False):
+                    raise ConcurrentModificationError(
+                        f"Cannot approve correction for employee '{correction['employee_id']}' on {correction['attendance_date']}: "
+                        "an active punch session is currently open. Employee must punch out before correction approval."
+                    )
+
+                current_punches = current_att.get("punches", [])
+                if len(current_punches) != len(snapshot_punches):
+                    raise ConcurrentModificationError(
+                        f"Conflicting attendance modification detected: punches for employee '{correction['employee_id']}' "
+                        f"on {correction['attendance_date']} were modified after this correction was requested "
+                        f"({len(current_punches)} punches found vs {len(snapshot_punches)} in request snapshot)."
+                    )
+
+                for cur_p, snap_p in zip(current_punches, snapshot_punches):
+                    cur_in = cur_p.get("punch_in")
+                    snap_in = snap_p.get("punch_in")
+                    cur_out = cur_p.get("punch_out")
+                    snap_out = snap_p.get("punch_out")
+                    if str(cur_in) != str(snap_in) or str(cur_out) != str(snap_out):
+                        raise ConcurrentModificationError(
+                            "Conflicting attendance modification detected: punch timestamps were modified after this correction was requested."
+                        )
+
             # Build updated punches from proposed punches
             new_punches = []
             for p in correction["proposed_punches"]:
@@ -270,47 +318,132 @@ class CorrectionService:
                 has_active_session=False,
             )
 
-            original_snapshot = correction.get("original_record_snapshot", {})
-
             # Prepare comprehensive before-and-after audit history entry
             audit_entry = {
                 "correction_id": str(correction["_id"]),
                 "applied_at": now_utc,
                 "reviewed_by": reviewer_id,
                 "reason": correction["reason"],
-                "previous_punches": original_snapshot.get("punches", []),
+                "previous_punches": snapshot_punches,
                 "new_punches": new_punches,
-                "previous_total_minutes": original_snapshot.get("total_work_minutes", 0),
+                "previous_total_minutes": original_snapshot.get("total_work_minutes", 0) if original_snapshot else 0,
                 "new_total_minutes": new_total_minutes,
-                "previous_status": original_snapshot.get("status", AttendanceStatus.ABSENT.value),
+                "previous_status": original_snapshot.get("status", AttendanceStatus.ABSENT.value) if original_snapshot else AttendanceStatus.ABSENT.value,
                 "new_status": new_status.value,
             }
 
-            # Atomically update or insert attendance record
-            await self.attendance_collection.update_one(
-                {
-                    "employee_id": correction["employee_id"],
-                    "date": correction["attendance_date"],
-                },
+            # 1. CAS on correction status first: PENDING -> APPROVED
+            # Guarantees single-winner resolution among concurrent reviewers.
+            update_result = await self.corrections_collection.update_one(
+                {"_id": oid, "status": CorrectionStatus.PENDING.value},
                 {
                     "$set": {
-                        "punches": new_punches,
-                        "has_active_session": False,
-                        "total_work_minutes": new_total_minutes,
-                        "status": new_status.value,
-                        "is_corrected": True,
-                        "updated_at": now_utc,
-                    },
-                    "$push": {"audit_history": audit_entry},
-                    "$setOnInsert": {
-                        "employee_id": correction["employee_id"],
-                        "department": original_snapshot.get("department", "General"),
-                        "date": correction["attendance_date"],
-                        "created_at": now_utc,
-                    },
+                        "status": target_status.value,
+                        "reviewed_by": reviewer_id,
+                        "review_remarks": remarks,
+                        "reviewed_at": now_utc,
+                    }
                 },
-                upsert=True,
             )
+            if update_result.modified_count == 0:
+                latest = await self.corrections_collection.find_one({"_id": oid})
+                current_status = latest.get("status", "UNKNOWN") if latest else "UNKNOWN"
+                raise CorrectionAlreadyResolvedError(current_status)
+
+            # 2. Apply updated attendance record with appended audit log.
+            # Employs optimistic concurrency matching on punches and active session status.
+            # If this write fails, compensating rollback reverts correction status back to PENDING.
+            # If the compensating rollback also fails, DatabaseInconsistencyError is raised.
+            try:
+                # Conditional write filter to ensure no concurrent modification occurred in the race window
+                if current_att:
+                    att_filter = {
+                        "_id": current_att["_id"],
+                        "has_active_session": False,
+                        "punches": current_att.get("punches", []),
+                    }
+                else:
+                    att_filter = {
+                        "employee_id": correction["employee_id"],
+                        "date": correction["attendance_date"],
+                    }
+
+                att_write_res = await self.attendance_collection.update_one(
+                    att_filter,
+                    {
+                        "$set": {
+                            "punches": new_punches,
+                            "has_active_session": False,
+                            "total_work_minutes": new_total_minutes,
+                            "status": new_status.value,
+                            "is_corrected": True,
+                            "updated_at": now_utc,
+                        },
+                        "$push": {"audit_history": audit_entry},
+                        "$setOnInsert": {
+                            "employee_id": correction["employee_id"],
+                            "department": (original_snapshot or {}).get("department", "General"),
+                            "date": correction["attendance_date"],
+                            "created_at": now_utc,
+                        },
+                    },
+                    upsert=True if not current_att else False,
+                )
+
+                if current_att and att_write_res.matched_count == 0:
+                    raise ConcurrentModificationError(
+                        "Attendance record was modified concurrently during the approval write window."
+                    )
+
+            except Exception as att_err:
+                logger.critical(
+                    "Database write failed for attendance after approving correction %s. Reverting correction status to PENDING: %s",
+                    correction_id,
+                    att_err,
+                    exc_info=True,
+                )
+                try:
+                    await self.corrections_collection.update_one(
+                        {"_id": oid, "status": target_status.value},
+                        {
+                            "$set": {
+                                "status": CorrectionStatus.PENDING.value,
+                                "reviewed_by": None,
+                                "review_remarks": None,
+                                "reviewed_at": None,
+                            }
+                        },
+                    )
+                except Exception as recovery_err:
+                    logger.critical(
+                        "FATAL: Compensating recovery failed for correction %s. System is in an inconsistent state! Error: %s",
+                        correction_id,
+                        recovery_err,
+                        exc_info=True,
+                    )
+                    raise DatabaseInconsistencyError(
+                        f"Attendance write failed and compensating recovery also failed for correction {correction_id}. "
+                        f"Manual intervention required: {recovery_err}"
+                    ) from recovery_err
+                raise att_err
+
+        else:
+            # target_status == REJECTED
+            update_result = await self.corrections_collection.update_one(
+                {"_id": oid, "status": CorrectionStatus.PENDING.value},
+                {
+                    "$set": {
+                        "status": target_status.value,
+                        "reviewed_by": reviewer_id,
+                        "review_remarks": remarks,
+                        "reviewed_at": now_utc,
+                    }
+                },
+            )
+            if update_result.modified_count == 0:
+                latest = await self.corrections_collection.find_one({"_id": oid})
+                current_status = latest.get("status", "UNKNOWN") if latest else "UNKNOWN"
+                raise CorrectionAlreadyResolvedError(current_status)
 
         updated_correction = await self.corrections_collection.find_one({"_id": oid})
         logger.info(
@@ -320,6 +453,42 @@ class CorrectionService:
             reviewer_id,
         )
         return self._doc_to_response(updated_correction)
+
+    async def _rollback_attendance_record(
+        self,
+        employee_id: str,
+        date_str: str,
+        original_snapshot: Dict[str, Any],
+    ) -> None:
+        """Rollback attendance record to previous snapshot on review transaction failure."""
+        try:
+            if not original_snapshot.get("punches") and original_snapshot.get("total_work_minutes", 0) == 0:
+                await self.attendance_collection.delete_one({"employee_id": employee_id, "date": date_str})
+            else:
+                await self.attendance_collection.update_one(
+                    {"employee_id": employee_id, "date": date_str},
+                    {
+                        "$set": {
+                            "punches": original_snapshot.get("punches", []),
+                            "has_active_session": False,
+                            "total_work_minutes": original_snapshot.get("total_work_minutes", 0),
+                            "status": original_snapshot.get("status", AttendanceStatus.ABSENT.value),
+                            "is_corrected": original_snapshot.get("is_corrected", False),
+                        },
+                        "$pop": {"audit_history": 1},
+                    },
+                )
+            logger.info("Successfully rolled back attendance record for employee %s on %s", employee_id, date_str)
+        except Exception as rb_err:
+            logger.critical(
+                "CRITICAL COMPENSATING TRANSACTION FAILURE: Failed to rollback attendance record for %s on %s: %s",
+                employee_id,
+                date_str,
+                rb_err,
+                exc_info=True,
+            )
+            raise
+
 
     async def list_corrections(
         self,
