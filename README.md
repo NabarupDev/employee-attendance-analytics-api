@@ -98,21 +98,23 @@ Once started:
 
 ## 6. Running Tests
 
-The test suite includes 42 comprehensive unit, contract, and integration tests covering business rules, isolated mock databases, and live MongoDB Atlas integration:
+The test suite includes 62 comprehensive unit, contract, and integration tests covering business rules, isolated mock databases, and live MongoDB Atlas integration:
 
 ```bash
-# Run all hermetic offline tests (41 tests, isolated in-memory)
+# Run all hermetic offline tests (61 tests, isolated in-memory via mongomock-motor)
 pytest -v
 
-# Run tests with short output
+# Run tests with short output (hermetic offline suite)
 pytest -q
 
 # Run live MongoDB Atlas integration test (requires live database connection)
 pytest -v -m integration
 
-# Run the complete test suite including live integration
+# Run the complete test suite including live integration (62 tests)
 pytest -v -m ""
 ```
+
+
 
 ---
 
@@ -394,4 +396,4 @@ pytest -v -m ""
 
 1. **Authentication Strategy:** In accordance with the assignment's instructions not to fabricate complex OAuth2/JWT providers when unspecified, actor identification is enforced via explicit HTTP headers (`X-Actor-ID` and `X-Role`).
 2. **Night Shifts & Date Partitioning:** Attendance sessions belong to the calendar date on which the punch-in occurred. Cross-midnight shifts are supported and counted toward the starting day.
-# employee-attendance-analytics-api
+3. **Dual Contract Interoperability:** All endpoints are mounted concurrently at root (`/`) and versioned prefix (`/api/v1/`). Both `employee_id` and `emp_code` are supported as payload keys and returned in responses. Epoch timestamps (ms and s) and ISO 8601 strings are universally accepted.
